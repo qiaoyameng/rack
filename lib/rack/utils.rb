@@ -106,6 +106,10 @@ module Rack
       Rack::Utils.default_query_parser.parse_nested_query(qs, d)
     end
 
+    def parse_nested_query_with_provenance(qs, d = nil)
+      Rack::Utils.default_query_parser.parse_nested_query_with_provenance(qs, d)
+    end
+
     def build_query(params)
       params.map { |k, v|
         if v.class == Array

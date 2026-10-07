@@ -129,6 +129,15 @@ describe Rack::Utils do
     Rack::Utils.parse_nested_query(nil).must_equal({})
   end
 
+  it "parse nested query with provenance via the default query parser" do
+    qs = "a[b]=1&a[b]=2"
+    params, provenance = Rack::Utils.parse_nested_query_with_provenance(qs)
+    params.must_equal Rack::Utils.parse_nested_query(qs)
+    provenance["a"]["b"].param_index.must_equal 1
+    qs[provenance["a"]["b"].range].must_equal "a[b]=2"
+    qs[provenance["a"]["b"].overwritten[0].range].must_equal "a[b]=1"
+  end
+
   it "raise an exception if the params are too deep" do
     len = Rack::Utils.param_depth_limit
 
