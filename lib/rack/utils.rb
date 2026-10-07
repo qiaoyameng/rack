@@ -106,6 +106,14 @@ module Rack
       Rack::Utils.default_query_parser.parse_nested_query(qs, d)
     end
 
+    # Like parse_nested_query, but returns a
+    # Rack::QueryParser::Provenance that also carries the source (pair
+    # index and character range in the query string) of every final leaf
+    # value and of every value overwritten during parsing.
+    def parse_nested_query_with_provenance(qs, d = nil)
+      Rack::Utils.default_query_parser.parse_nested_query_with_provenance(qs, d)
+    end
+
     def build_query(params)
       params.map { |k, v|
         if v.class == Array

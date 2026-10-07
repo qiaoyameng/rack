@@ -240,6 +240,187 @@ describe Rack::Utils do
       message.must_equal "expected Array (got String) for param `y'"
   end
 
+  describe "parse_nested_query_with_provenance" do
+    def parse_provenance(qs)
+      Rack::Utils.parse_nested_query_with_provenance(qs)
+    end
+
+    it "returns the same params as parse_nested_query for the same input" do
+      [
+        "foo=bar",
+        "a[b]=1&a[b]=2",
+        "a=1&a=2&a=3",
+        "foo&foo=",
+        "&foo=1&&bar=2",
+        "foo[]=bar&foo[",
+        "foo[]=bar&foo[=baz",
+        "foo[]=1&foo[]=2",
+        "x[y][z][]=1&x[y][z][]=2",
+        "x[y][][z]=1&x[y][][w]=a&x[y][][z]=2&x[y][][w]=3",
+        "x[][y]=1&x[][z][w]=a&x[][y]=2&x[][z][w]=b",
+        "x[][z][w]=a&x[][y]=1&x[][z][w]=b&x[][y]=2",
+        "data[books][][data][page]=1&data[books][][data][page]=2",
+        "[]=1&[a]=2&b[=3&c]=4",
+        "d[[]=5&e][]=6&f[[]=7",
+        "g[h]i=8&j[k]l[m]=9",
+        "l[[[[[[[[]]]]]]]=10",
+        "my+weird+field=q1%212%22%27w%245%267%2Fz8%29%3F",
+        "a[b]=1&a=2",
+        "a[]=1&a=2",
+        "",
+        nil,
+      ].each do |qs|
+        parse_provenance(qs).params.must_equal Rack::Utils.parse_nested_query(qs)
+      end
+    end
+
+    it "yields ranges that slice back to the original pairs" do
+      [
+        "a[b]=1&a[b]=2",
+        "a=1&a=2&a=3",
+        "&foo=1&&bar=2",
+        "foo&foo=",
+        "x[y][][z]=1&x[y][][w]=a&x[y][][z]=2&x[y][][w]=3",
+        "x[][y]=1&x[][z][w]=a&x[][y]=2&x[][z][w]=b",
+        "a=1&  b=2&c=3",
+        "my+weird+field=q1%212%22%27w%245%267%2Fz8%29%3F",
+      ].each do |qs|
+        provenance = parse_provenance(qs)
+        raw_pairs = qs.split(/& */).reject(&:empty?)
+        provenance.leaves.each do |leaf|
+          raw_pairs[leaf.pair_index].must_equal qs[leaf.range]
+        end
+        provenance.overwrites.each do |overwrite|
+          raw_pairs[overwrite.pair_index].must_equal qs[overwrite.range]
+          raw_pairs[overwrite.replaced_by.pair_index].must_equal qs[overwrite.replaced_by.range]
+        end
+      end
+    end
+
+    it "locates every final leaf by pair index and character range" do
+      qs = "a[b]=1&a[b]=2"
+      provenance = parse_provenance(qs)
+      provenance.params.must_equal "a" => { "b" => "2" }
+      provenance.leaves.length.must_equal 1
+      leaf = provenance.leaves.first
+      leaf.path.must_equal ["a", "b"]
+      leaf.pair_index.must_equal 1
+      qs[leaf.range].must_equal "a[b]=2"
+    end
+
+    it "reports the sources of overwritten values" do
+      qs = "a[b]=1&a[b]=2"
+      provenance = parse_provenance(qs)
+      provenance.overwrites.length.must_equal 1
+      overwrite = provenance.overwrites.first
+      overwrite.path.must_equal ["a", "b"]
+      overwrite.pair_index.must_equal 0
+      qs[overwrite.range].must_equal "a[b]=1"
+      overwrite.replaced_by.pair_index.must_equal 1
+      qs[overwrite.replaced_by.range].must_equal "a[b]=2"
+    end
+
+    it "tracks overwrite chains for repeated plain keys" do
+      qs = "a=1&a=2&a=3"
+      provenance = parse_provenance(qs)
+      provenance.params.must_equal "a" => "3"
+      provenance.leaves.map(&:pair_index).must_equal [2]
+      provenance.overwrites.map(&:pair_index).must_equal [0, 1]
+      provenance.overwrites.map { |overwrite| overwrite.replaced_by.pair_index }.must_equal [1, 2]
+      provenance.overwrites.each do |overwrite|
+        qs[overwrite.range].must_equal "a=#{overwrite.pair_index + 1}"
+      end
+    end
+
+    it "tracks leaves merged into arrays of hashes without fixed indices" do
+      qs = "x[][y]=1&x[][z][w]=a&x[][y]=2&x[][z][w]=b"
+      provenance = parse_provenance(qs)
+      provenance.params.must_equal "x" => [
+        { "y" => "1", "z" => { "w" => "a" } },
+        { "y" => "2", "z" => { "w" => "b" } },
+      ]
+      provenance.leaves.map { |leaf| [leaf.path, leaf.pair_index, qs[leaf.range]] }.must_equal [
+        [["x", 0, "y"], 0, "x[][y]=1"],
+        [["x", 0, "z", "w"], 1, "x[][z][w]=a"],
+        [["x", 1, "y"], 2, "x[][y]=2"],
+        [["x", 1, "z", "w"], 3, "x[][z][w]=b"],
+      ]
+      provenance.overwrites.must_equal []
+    end
+
+    it "tracks values overwritten by shallower parameters" do
+      qs = "x[y]=1&x=2"
+      provenance = parse_provenance(qs)
+      provenance.params.must_equal "x" => "2"
+      provenance.leaves.map(&:path).must_equal [["x"]]
+      overwrite = provenance.overwrites.first
+      overwrite.path.must_equal ["x", "y"]
+      qs[overwrite.range].must_equal "x[y]=1"
+      qs[overwrite.replaced_by.range].must_equal "x=2"
+    end
+
+    it "handles bare keys, empty values and empty pairs like parse_nested_query" do
+      qs = "&foo&&bar="
+      provenance = parse_provenance(qs)
+      provenance.params.must_equal "foo" => nil, "bar" => ""
+      provenance.leaves.map { |leaf| [leaf.path, leaf.pair_index, qs[leaf.range]] }.must_equal [
+        [["foo"], 0, "foo"],
+        [["bar"], 1, "bar="],
+      ]
+
+      provenance = parse_provenance("foo&foo=")
+      provenance.params.must_equal "foo" => ""
+      provenance.leaves.map(&:pair_index).must_equal [1]
+      provenance.overwrites.map(&:pair_index).must_equal [0]
+    end
+
+    it "attaches both sources to type conflict errors without echoing values" do
+      qs = "secret=hunter2&secret[k]=v"
+      error = lambda { parse_provenance(qs) }.must_raise(Rack::QueryParser::ParameterTypeError)
+      error.message.must_equal "expected Hash (got String) for param `secret'"
+      error.message.wont_include "hunter2"
+      error.existing_sources.length.must_equal 1
+      error.existing_sources.first.path.must_equal ["secret"]
+      error.existing_sources.first.pair_index.must_equal 0
+      qs[error.existing_sources.first.range].must_equal "secret=hunter2"
+      error.incoming_source.pair_index.must_equal 1
+      qs[error.incoming_source.range].must_equal "secret[k]=v"
+    end
+
+    it "raises the same conflict errors as parse_nested_query, which carries no sources" do
+      ["a=1&a[b]=2", "x[y]=1&x[]=1", "x[y]=1&x[y][][w]=2"].each do |qs|
+        plain = lambda { Rack::Utils.parse_nested_query(qs) }.must_raise(Rack::QueryParser::ParameterTypeError)
+        traced = lambda { parse_provenance(qs) }.must_raise(Rack::QueryParser::ParameterTypeError)
+        traced.message.must_equal plain.message
+        plain.existing_sources.must_be_nil
+        plain.incoming_source.must_be_nil
+      end
+    end
+
+    it "enforces the depth limit like parse_nested_query" do
+      len = Rack::Utils.param_depth_limit
+
+      lambda {
+        parse_provenance("foo#{"[a]" * len}=bar")
+      }.must_raise(Rack::QueryParser::ParamsTooDeepError)
+
+      parse_provenance("foo#{"[a]" * (len - 1)}=bar").params.
+        must_equal Rack::Utils.parse_nested_query("foo#{"[a]" * (len - 1)}=bar")
+    end
+
+    it "enforces the params limit like parse_nested_query" do
+      parser = Rack::QueryParser.new(Rack::QueryParser::Params, 32, params_limit: 3)
+
+      lambda {
+        parser.parse_nested_query_with_provenance("a=1&b=2&c=3&d=4")
+      }.must_raise(Rack::QueryParser::QueryLimitError).
+        message.must_equal "total number of query parameters (4) exceeds limit (3)"
+
+      parser.parse_nested_query_with_provenance("a=1&b=2&c=3").params.
+        must_equal parser.parse_nested_query("a=1&b=2&c=3")
+    end
+  end
+
   it "can parse a query string with a key that has invalid UTF-8 encoded bytes" do
     Rack::Utils.parse_nested_query("foo%81E=1").must_equal "foo\x81E"=>"1"
   end
