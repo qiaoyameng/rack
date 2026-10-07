@@ -89,7 +89,21 @@ module Rack
   #           [:fonts, {'access-control-allow-origin' => '*'}]
   #         ]
   #
+  # Serve precompressed representations of the files when the client accepts
+  # them, selecting from files that actually exist according to the request's
+  # Accept-Encoding quality values and the server preference order (br is
+  # preferred over gzip below). No on-the-fly compression is performed:
+  #
+  #     use Rack::Static, :urls => [""], :root => 'public',
+  #         :precompressed_versions => {'br' => '.br', 'gzip' => '.gz'}
+  #
+  # The legacy :gzip => true option is equivalent to
+  # :precompressed_versions => {'gzip' => '.gz'}.
+  #
   class Static
+    # Sentinel content coding used for the uncompressed resource.
+    IDENTITY_ENCODING = 'identity'.freeze
+
     def initialize(app, options = {})
       @app = app
       @urls = options[:urls] || ["/favicon.ico"]
@@ -97,9 +111,22 @@ module Rack
         @urls = @urls.map { |url| [url, url.end_with?('/') ? url : "#{url}/".freeze].freeze }.freeze
       end
       @index = options[:index]
-      @gzip = options[:gzip]
       @cascade = options[:cascade]
       root = options[:root] || Dir.pwd
+
+      # Mapping of content-coding name to the file extension of the
+      # precompressed representation (e.g. {'gzip' => '.gz', 'br' => '.br'}).
+      precompressed_versions = options[:precompressed_versions]
+      if options[:gzip]
+        precompressed_versions ||= {}
+        precompressed_versions['gzip'] ||= '.gz'
+      end
+      if precompressed_versions
+        @precompressed_versions = precompressed_versions.map do |encoding, extension|
+          extension = ".#{extension}" unless extension.start_with?('.')
+          [encoding.to_s, extension]
+        end.to_h.freeze
+      end
 
       # HTTP Headers
       @header_rules = options[:header_rules] || []
@@ -126,32 +153,21 @@ module Rack
     end
 
     def call(env)
-      path = env[PATH_INFO]
-      actual_path = Utils.clean_path_info(Utils.unescape_path(path))
+      original_path = env[PATH_INFO]
+      actual_path = Utils.clean_path_info(Utils.unescape_path(original_path))
 
-      if can_serve(actual_path)
-        if overwrite_file_path(path)
-          env[PATH_INFO] = (add_index_root?(path) ? path + @index : @urls[path])
-        elsif @gzip && env['HTTP_ACCEPT_ENCODING'] && /\bgzip\b/.match?(env['HTTP_ACCEPT_ENCODING'])
-          path = env[PATH_INFO]
-          env[PATH_INFO] += '.gz'
-          response = @file_server.call(env)
-          env[PATH_INFO] = path
+      return @app.call(env) unless can_serve(actual_path)
 
-          if response[0] == 404
-            response = nil
-          elsif response[0] == 304
-            # Do nothing, leave headers as is
-          else
-            response[1][CONTENT_TYPE] = Mime.mime_type(::File.extname(path), 'text/plain')
-            response[1]['content-encoding'] = 'gzip'
-          end
+      begin
+        if overwrite_file_path(original_path)
+          env[PATH_INFO] = (add_index_root?(original_path) ? original_path + @index : @urls[original_path])
         end
 
         path = env[PATH_INFO]
-        response ||= @file_server.call(env)
+        response = serve_representation(env, path)
 
         if @cascade && response[0] == 404
+          env[PATH_INFO] = original_path
           return @app.call(env)
         end
 
@@ -159,10 +175,177 @@ module Rack
         applicable_rules(path).each do |rule, new_headers|
           new_headers.each { |field, content| headers[field] = content }
         end
+        merge_vary(headers) if negotiated?(env)
 
         response
+      ensure
+        env[PATH_INFO] = original_path
+      end
+    end
+
+    private
+
+    # Serve the best available representation of the resource located at
+    # +path+, taking the client's Accept-Encoding header into account when
+    # precompressed versions are configured.
+    #
+    # The Content-Type is always derived from the original resource, while
+    # Content-Length, Last-Modified, Range handling and conditional request
+    # handling refer to the bytes of the representation actually selected.
+    def serve_representation(env, path)
+      negotiated = negotiated?(env)
+      resource_exists = false
+
+      if negotiated
+        available = available_encodings(path)
+        resource_exists = !available.empty?
+
+        # When at least one representation exists, an acceptable coding
+        # must be chosen; otherwise the resource itself is missing and the
+        # regular 404 flow (including cascade) applies.
+        encoding = resource_exists ?
+          best_encoding(available, Rack::Request.new(env).accept_encoding) :
+          IDENTITY_ENCODING
       else
-        @app.call(env)
+        encoding = IDENTITY_ENCODING
+      end
+
+      return not_acceptable if negotiated && resource_exists && encoding.nil?
+
+      if encoding == IDENTITY_ENCODING
+        response = @file_server.call(env)
+        return response unless negotiated
+      else
+        env[PATH_INFO] = "#{path}#{@precompressed_versions[encoding]}"
+        response = @file_server.call(env)
+      end
+
+      merge_vary(response[1])
+      return not_acceptable if negotiated && resource_exists && response[0] == 404
+
+      decorate_representation(response, encoding, path)
+      response
+    end
+
+    # Set the headers describing the representation that was selected:
+    # Content-Type from the original resource, Content-Encoding for a
+    # precompressed representation. Only applied to responses that actually
+    # transfer (or revalidate against) the representation's bytes.
+    def decorate_representation(response, encoding, path)
+      case response[0]
+      when 200, 206
+        headers = response[1]
+        if encoding == IDENTITY_ENCODING
+          return
+        elsif headers[CONTENT_LENGTH] == '0'
+          # Rack::Files answers OPTIONS with an empty body; such a
+          # response does not carry any encoded representation.
+          return
+        end
+
+        if headers.key?(CONTENT_TYPE)
+          headers[CONTENT_TYPE] = Mime.mime_type(::File.extname(path), 'text/plain') unless
+            headers[CONTENT_TYPE].include?('multipart/byteranges')
+        end
+        headers['content-encoding'] = encoding
+      when 304
+        response[1]['content-encoding'] = encoding unless encoding == IDENTITY_ENCODING
+      end
+    end
+
+    def negotiated?(env)
+      @precompressed_versions && env.key?('HTTP_ACCEPT_ENCODING')
+    end
+
+    # List the content codings whose representation file exists on disk,
+    # including identity when the original resource exists.
+    def available_encodings(path)
+      available = []
+      available << IDENTITY_ENCODING if file_exists?(path)
+      @precompressed_versions.each do |encoding, extension|
+        available << encoding if precompressed_file?(path, extension)
+      end
+      available
+    end
+
+    # Select the best available content coding from the parsed
+    # Accept-Encoding entries (each an [encoding, quality] pair).
+    #
+    # Unlike Rack::Utils.select_best_encoding this honors the RFC 7231
+    # wildcard rules: encodings listed explicitly with q=0 keep being
+    # forbidden even when the wildcard allows them, and the implicit
+    # identity fallback is only used when identity has not been mentioned
+    # explicitly.
+    def best_encoding(available, accept_encoding)
+      accept_encoding = accept_encoding.first(16)
+      explicit = accept_encoding.map(&:first)
+      wildcard_quality = nil
+      accept_encoding.each do |encoding, quality|
+        wildcard_quality = quality if encoding == '*'
+      end
+
+      candidates = available.map do |encoding|
+        if (index = explicit.index(encoding))
+          [encoding, accept_encoding[index][1], available.index(encoding)]
+        elsif encoding == IDENTITY_ENCODING
+          # RFC 7231 5.3.4: identity not listed explicitly is always
+          # acceptable, but ranks below every wildcard match and is only
+          # a last resort.
+          quality = wildcard_quality || 0.001
+          [encoding, quality, available.length]
+        elsif wildcard_quality
+          [encoding, wildcard_quality, available.index(encoding)]
+        end
+      end.compact
+
+      candidate = candidates.min do |(_, q1, p1), (_, q2, p2)|
+        if (q = (q2 <=> q1)).nonzero?
+          q
+        else
+          p1 <=> p2
+        end
+      end
+
+      return nil if candidate.nil? || candidate[1] == 0.0
+      candidate[0]
+    end
+
+    # Resolve the on-disk location of a request path, following the same
+    # path handling as Rack::Files.
+    def disk_path(path)
+      ::File.join(@file_server.root, Utils.clean_path_info(Utils.unescape_path(path)))
+    end
+
+    def file_exists?(path)
+      candidate = disk_path(path)
+      ::File.file?(candidate) && ::File.readable?(candidate)
+    rescue SystemCallError
+      false
+    end
+
+    def precompressed_file?(path, extension)
+      file_exists?("#{path}#{extension}")
+    end
+
+    def not_acceptable
+      body = "Not Acceptable\n"
+      [
+        406,
+        {
+          CONTENT_TYPE     => 'text/plain',
+          CONTENT_LENGTH   => body.bytesize.to_s,
+          'vary'           => 'Accept-Encoding'
+        },
+        [body]
+      ]
+    end
+
+    # Add Accept-Encoding to the Vary header, preserving any values already
+    # present instead of replacing them.
+    def merge_vary(headers)
+      vary = headers['vary'].to_s.split(',').map(&:strip)
+      unless vary.include?('*') || vary.any? { |value| value.casecmp('accept-encoding').zero? }
+        headers['vary'] = vary.push('Accept-Encoding').join(', ')
       end
     end
 

@@ -165,6 +165,226 @@ describe Rack::Static do
     res.body.must_be :empty?
   end
 
+  PRECOMPRESSED_ROOT = File.join(root, "static", "precompressed")
+  PRECOMPRESSED_OPTIONS = {
+    urls: [""],
+    root: PRECOMPRESSED_ROOT,
+    precompressed_versions: { 'br' => '.br', 'gzip' => '.gz' }
+  }
+
+  def precompressed_request(options = PRECOMPRESSED_OPTIONS)
+    Rack::MockRequest.new(static(DummyApp.new, options))
+  end
+
+  def precompressed_path(name)
+    File.join(PRECOMPRESSED_ROOT, name)
+  end
+
+  it "serves the configured precompressed representation preferred by the client" do
+    res = precompressed_request.get("/doc.txt", 'HTTP_ACCEPT_ENCODING' => 'gzip, br')
+
+    res.must_be :ok?
+    res.headers['content-encoding'].must_equal 'br'
+    res.headers['content-type'].must_equal 'text/plain'
+    res.body.must_equal "BROTLI-PRECOMPRESSED-PAYLOAD\n"
+    res.headers['vary'].must_equal 'Accept-Encoding'
+  end
+
+  it "uses client quality values to pick the representation" do
+    res = precompressed_request.get("/doc.txt", 'HTTP_ACCEPT_ENCODING' => 'br;q=0.5, gzip;q=0.9')
+
+    res.must_be :ok?
+    res.headers['content-encoding'].must_equal 'gzip'
+    Zlib::GzipReader.wrap(StringIO.new(res.body), &:read).must_equal "gzip precompressed representation\n"
+  end
+
+  it "falls back to a lower quality representation the client accepts when the preferred file does not exist" do
+    res = precompressed_request.get("/gzip_only.txt", 'HTTP_ACCEPT_ENCODING' => 'br;q=1, gzip;q=0.5')
+
+    res.must_be :ok?
+    res.headers['content-encoding'].must_equal 'gzip'
+    res.headers['vary'].must_equal 'Accept-Encoding'
+  end
+
+  it "serves identity when only identity is acceptable for the configured extensions" do
+    res = precompressed_request.get("/gzip_only.txt", 'HTTP_ACCEPT_ENCODING' => 'br;q=1, gzip;q=0')
+
+    res.must_be :ok?
+    res.headers['content-encoding'].must_be_nil
+    res.body.must_equal "only gzip original\n"
+    res.headers['vary'].must_equal 'Accept-Encoding'
+  end
+
+  it "does not let a wildcard override an explicit q=0 encoding" do
+    res = precompressed_request.get("/doc.txt", 'HTTP_ACCEPT_ENCODING' => 'gzip;q=0, *;q=1')
+
+    res.must_be :ok?
+    res.headers['content-encoding'].must_equal 'br'
+  end
+
+  it "returns 406 when identity is forbidden and no other representation exists" do
+    res = precompressed_request.get("/plain.txt", 'HTTP_ACCEPT_ENCODING' => 'identity;q=0')
+
+    res.status.must_equal 406
+    res.headers['vary'].must_equal 'Accept-Encoding'
+  end
+
+  it "returns 406 when every existing representation is forbidden with q=0" do
+    res = precompressed_request.get("/doc.txt", 'HTTP_ACCEPT_ENCODING' => 'gzip;q=0, br;q=0, identity;q=0')
+
+    res.status.must_equal 406
+  end
+
+  it "serves the original resource when no Accept-Encoding header is sent" do
+    res = precompressed_request.get("/doc.txt")
+
+    res.must_be :ok?
+    res.headers['content-encoding'].must_be_nil
+    res.headers['vary'].must_be_nil
+    res.body.must_equal "original plain text representation\n"
+  end
+
+  it "reports Content-Length of the selected representation" do
+    gzip_size = File.size(precompressed_path("doc.txt.gz"))
+    res = precompressed_request.get("/doc.txt", 'HTTP_ACCEPT_ENCODING' => 'gzip')
+
+    res.must_be :ok?
+    res.headers['content-length'].must_equal gzip_size.to_s
+    res.headers['content-length'].wont_equal File.size(precompressed_path("doc.txt")).to_s
+  end
+
+  it "applies Range requests to the selected representation" do
+    gzip_size = File.size(precompressed_path("doc.txt.gz"))
+    res = precompressed_request.get("/doc.txt",
+      'HTTP_ACCEPT_ENCODING' => 'gzip',
+      'HTTP_RANGE' => "bytes=0-9")
+
+    res.status.must_equal 206
+    res.headers['content-encoding'].must_equal 'gzip'
+    res.headers['content-range'].must_equal "bytes 0-9/#{gzip_size}"
+    res.headers['content-length'].must_equal '10'
+    res.body.bytesize.must_equal 10
+    res.body.must_equal File.binread(precompressed_path("doc.txt.gz"), 10)
+  end
+
+  it "uses the Last-Modified of the selected representation for conditional requests" do
+    gzip_mtime = File.mtime(precompressed_path("doc.txt.gz")).httpdate
+    res = precompressed_request.get("/doc.txt",
+      'HTTP_ACCEPT_ENCODING' => 'gzip',
+      'HTTP_IF_MODIFIED_SINCE' => gzip_mtime)
+
+    res.status.must_equal 304
+    res.body.must_be :empty?
+    res.headers['content-encoding'].must_equal 'gzip'
+    res.headers['vary'].must_equal 'Accept-Encoding'
+
+    res = precompressed_request.get("/doc.txt",
+      'HTTP_ACCEPT_ENCODING' => 'gzip',
+      'HTTP_IF_MODIFIED_SINCE' => File.mtime(precompressed_path("doc.txt")).httpdate)
+    res.status.must_equal 200
+  end
+
+  it "supports HEAD requests for precompressed representations" do
+    res = precompressed_request.request("HEAD", "/doc.txt", 'HTTP_ACCEPT_ENCODING' => 'gzip')
+
+    res.must_be :ok?
+    res.headers['content-encoding'].must_equal 'gzip'
+    res.headers['content-type'].must_equal 'text/plain'
+    res.headers['content-length'].must_equal File.size(precompressed_path("doc.txt.gz")).to_s
+    res.body.must_be :empty?
+  end
+
+  it "merges with an existing Vary header instead of overwriting it" do
+    options = PRECOMPRESSED_OPTIONS.merge(header_rules: [
+      [:all, { 'vary' => 'Cookie' }]
+    ])
+    res = Rack::MockRequest.new(static(DummyApp.new, options)).
+      get("/doc.txt", 'HTTP_ACCEPT_ENCODING' => 'gzip')
+
+    res.must_be :ok?
+    res.headers['vary'].split(',').map(&:strip).sort.must_equal %w(Accept-Encoding Cookie)
+  end
+
+  it "does not duplicate Accept-Encoding in Vary when already present" do
+    options = PRECOMPRESSED_OPTIONS.merge(header_rules: [
+      [:all, { 'vary' => 'accept-encoding' }]
+    ])
+    res = Rack::MockRequest.new(static(DummyApp.new, options)).
+      get("/doc.txt", 'HTTP_ACCEPT_ENCODING' => 'gzip')
+
+    res.headers['vary'].must_equal 'accept-encoding'
+  end
+
+  it "restores PATH_INFO after serving a mapped path" do
+    options = { urls: { "/" => "doc.txt" }, root: PRECOMPRESSED_ROOT,
+                precompressed_versions: { 'gzip' => '.gz' } }
+    app = Rack::Static.new(DummyApp.new, options)
+    env = Rack::MockRequest.env_for("/", 'HTTP_ACCEPT_ENCODING' => 'gzip')
+    original = env['PATH_INFO'].dup
+    app.call(env)
+    env['PATH_INFO'].must_equal original
+  end
+
+  it "restores PATH_INFO before cascading to the downstream app" do
+    captured = nil
+    downstream = lambda { |env| captured = env['PATH_INFO'].dup; [200, {}, ["downstream"]] }
+    options = PRECOMPRESSED_OPTIONS.merge(cascade: true)
+    app = Rack::Static.new(downstream, options)
+    res = Rack::MockRequest.new(Rack::Lint.new(app)).
+      get("/does-not-exist", 'HTTP_ACCEPT_ENCODING' => 'gzip')
+
+    res.body.must_equal "downstream"
+    captured.must_equal "/does-not-exist"
+  end
+
+  it "accepts extensions without a leading dot in precompressed_versions" do
+    options = { urls: [""], root: PRECOMPRESSED_ROOT,
+                precompressed_versions: { 'gzip' => 'gz' } }
+    res = Rack::MockRequest.new(static(DummyApp.new, options)).
+      get("/gzip_only.txt", 'HTTP_ACCEPT_ENCODING' => 'gzip')
+
+    res.must_be :ok?
+    res.headers['content-encoding'].must_equal 'gzip'
+  end
+
+  it "adds Vary on negotiated identity 304 responses" do
+    res = precompressed_request.get("/doc.txt",
+      'HTTP_ACCEPT_ENCODING' => 'gzip;q=0',
+      'HTTP_IF_MODIFIED_SINCE' => File.mtime(precompressed_path("doc.txt")).httpdate)
+
+    res.status.must_equal 304
+    res.headers['vary'].must_equal 'Accept-Encoding'
+    res.headers['content-encoding'].must_be_nil
+  end
+
+  it "negotiates precompressed versions for hash-mapped paths" do
+    options = {
+      urls: { "/doc" => "doc.txt" },
+      root: PRECOMPRESSED_ROOT,
+      precompressed_versions: { 'gzip' => '.gz' }
+    }
+    res = Rack::MockRequest.new(static(DummyApp.new, options)).
+      get("/doc", 'HTTP_ACCEPT_ENCODING' => 'gzip')
+
+    res.must_be :ok?
+    res.headers['content-encoding'].must_equal 'gzip'
+    Zlib::GzipReader.wrap(StringIO.new(res.body), &:read).must_equal "gzip precompressed representation\n"
+  end
+
+  it "restores PATH_INFO when the file server raises an exception" do
+    raising_files = Object.new
+    def raising_files.root; Dir.pwd; end
+    def raising_files.call(env); raise "boom"; end
+    options = { urls: [""], root: PRECOMPRESSED_ROOT,
+                precompressed_versions: { 'gzip' => '.gz' } }
+    app = Rack::Static.new(DummyApp.new, options)
+    app.instance_variable_set(:@file_server, raising_files)
+    env = Rack::MockRequest.env_for("/doc.txt", 'HTTP_ACCEPT_ENCODING' => 'gzip')
+    original = env['PATH_INFO'].dup
+    proc { app.call(env) }.must_raise RuntimeError
+    env['PATH_INFO'].must_equal original
+  end
+
   it "supports serving fixed cache-control (legacy option)" do
     opts = OPTIONS.merge(cache_control: 'public')
     request = Rack::MockRequest.new(static(DummyApp.new, opts))
